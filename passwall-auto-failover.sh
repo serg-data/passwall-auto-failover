@@ -19,6 +19,23 @@ trap cleanup EXIT INT TERM
 # =========================================================
 # Passwall2 Auto Failover (OpenWrt)
 #
+# Особенности логики:
+#
+#  ICMP можно отключать
+#  SOCKS проверяет реальную работу VPN
+#  SITE проверяет открытие сайтов
+#  Защита от restart storm
+#  FAIL_LIMIT защищает от LTE jitter
+#
+# 🔥 ВАЖНО:
+# OK счетчик теперь НЕ сбрасывается
+# при кратковременных FAIL.
+#
+# OK сбрасывается ТОЛЬКО:
+# - при реальном switch_node()
+# - при restart_passwall()
+#
+# Это намного стабильнее для LTE / VPN.
 # =========================================================
 #
 # Скрипт выбора резервной ноды
@@ -249,7 +266,15 @@ restart_passwall() {
     ip route flush cache
     echo 1 > /proc/sys/net/ipv4/route/flush
 
-    /etc/init.d/passwall2 restart
+    # =====================================================
+    # SOFT RESTART (LOW MEMORY SAFE)
+    # =====================================================
+
+    /etc/init.d/passwall2 stop
+
+    sleep 8
+
+    /etc/init.d/passwall2 start
 }
 
 
@@ -283,7 +308,15 @@ switch_node() {
     ip route flush cache
     echo 1 > /proc/sys/net/ipv4/route/flush
 
-    /etc/init.d/passwall2 restart
+    # =====================================================
+    # SOFT RESTART (LOW MEMORY SAFE)
+    # =====================================================
+
+    /etc/init.d/passwall2 stop
+
+    sleep 8
+
+    /etc/init.d/passwall2 start
 
     CURRENT_NODE="$NODE"
 }
