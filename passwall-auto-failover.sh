@@ -2,8 +2,19 @@
 
 LOCKDIR="/tmp/passwall-auto-failover.lock"
 
-# Удаляем stale lock старше 10 минут
-find "$LOCKDIR" -mmin +10 >/dev/null 2>&1 && rmdir "$LOCKDIR" 2>/dev/null
+# =========================================================
+# REMOVE STALE LOCK
+# =========================================================
+#
+# Иногда после crash / reboot lock может остаться.
+# Удаляем lock старше 10 минут.
+# =========================================================
+
+if [ -d "$LOCKDIR" ]; then
+    if [ "$(find "$LOCKDIR" -mmin +10 2>/dev/null)" ]; then
+        rmdir "$LOCKDIR" 2>/dev/null
+    fi
+fi
 
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
     logger -t passwall-failover "already running"
@@ -24,44 +35,34 @@ trap cleanup EXIT INT TERM
 #  ICMP можно отключать
 #  SOCKS проверяет реальную работу VPN
 #  SITE проверяет открытие сайтов
+#  MEMORY CHECK контролирует low RAM
 #  Защита от restart storm
 #  FAIL_LIMIT защищает от LTE jitter
 #
 # 🔥 ВАЖНО:
-# OK счетчик теперь НЕ сбрасывается
+#
+# OK счетчик НЕ сбрасывается
 # при кратковременных FAIL.
 #
 # OK сбрасывается ТОЛЬКО:
-# - при реальном switch_node()
-# - при restart_passwall()
 #
-# Это намного стабильнее для LTE / VPN.
+# - при switch_node()
+# - при restart_passwall()
+# - при memory recovery
+#
+# Это намного стабильнее для LTE/VPN.
 # =========================================================
 #
-# Скрипт выбора резервной ноды
-#   passwall-select-backup
-#
-# 📝 Создать / отредактировать скрипт:
+# 📝 Редактировать:
 #   vi /usr/bin/passwall-auto-failover.sh
 #
-# 🔍 Проверить текущее состояние:
-#   uci get passwall2.@global[0].node
-#
-# 📋 Посмотреть все серверы (ноды):
-#   uci show passwall2 | grep ".remarks="
-#
-# 🔎 Показать название текущего сервера:
-#   uci show passwall2 | grep "$(uci get passwall2.@global[0].node).remarks"
-#
-# 🔐 Дать права на выполнение:
+# 🔐 Права:
 #   chmod +x /usr/bin/passwall-auto-failover.sh
 #
-# ⏱ Добавить в автозапуск (cron):
-#   crontab -e
-#   * * * * * /usr/bin/passwall-auto-failover.sh
-#   /etc/init.d/cron restart
+# ⏱ Cron:
+#   */2 * * * * /usr/bin/passwall-auto-failover.sh
 #
-# 📜 Посмотреть логи:
+# 📜 Логи:
 #   logread | grep passwall-failover
 # =========================================================
 
@@ -89,9 +90,43 @@ SITE_FAIL_LIMIT=2
 # ENABLE / DISABLE CHECKS
 # =========================================================
 
-ENABLE_ICMP=1
+# ICMP проверки
+ENABLE_ICMP=0
+
+# SOCKS/VPN проверки
 ENABLE_SOCKS=1
+
+# Проверка открытия сайтов
 ENABLE_SITE=1
+
+
+# =========================================================
+# MEMORY CONTROL
+# =========================================================
+#
+# Полностью отключаемый memory watchdog.
+#
+# ENABLE_MEMORY_CONTROL=0
+#
+# Используется MemAvailable из /proc/meminfo
+# (самый правильный вариант для OpenWrt)
+#
+# Recommended:
+#
+# 64MB RAM  -> 5-8MB
+# 128MB RAM -> 8-12MB
+# 256MB RAM -> 10-20MB
+# =========================================================
+
+ENABLE_MEMORY_CONTROL=1
+
+# Минимум available RAM в MB
+MEMORY_MIN_AVAILABLE=15
+
+# cooldown между memory restart
+MEMORY_COOLDOWN=300
+
+MEMORY_RESTART_FILE="/tmp/passwall_memory_restart"
 
 
 # =========================================================
@@ -114,6 +149,7 @@ RESTART_FILE="/tmp/passwall_last_restart"
 # =========================================================
 
 get_node_id_by_name() {
+
     NAME="$1"
 
     uci show passwall2 | \
@@ -160,10 +196,16 @@ check_socks_node() {
 
 check_internet() {
 
-    # LTE blink protection
+    # =====================================================
+    # LTE BLINK PROTECTION
+    # =====================================================
+
     if [ "$LTE_MODE" = "1" ]; then
+
         if ! ip route | grep -q '^default'; then
-            logger -t passwall-failover "CHECK: no default route (LTE blink)"
+            logger -t passwall-failover \
+                "CHECK: no default route (LTE blink)"
+
             return 2
         fi
     fi
@@ -194,7 +236,8 @@ check_internet() {
             return 0
         fi
 
-        logger -t passwall-failover "CHECK: all ICMP checks failed"
+        logger -t passwall-failover \
+            "CHECK: all ICMP checks failed"
     fi
 
     # =====================================================
@@ -206,12 +249,16 @@ check_internet() {
         logger -t passwall-failover "CHECK: trying SOCKS"
 
         if check_socks_node; then
-            logger -t passwall-failover "CHECK: SOCKS fallback OK"
+            logger -t passwall-failover \
+                "CHECK: SOCKS fallback OK"
+
             return 0
         fi
     fi
 
-    logger -t passwall-failover "CHECK: FAIL (all enabled checks failed)"
+    logger -t passwall-failover \
+        "CHECK: FAIL (all enabled checks failed)"
+
     return 1
 }
 
@@ -223,21 +270,115 @@ check_internet() {
 check_site() {
 
     if wget -4 -q -T 3 -O /dev/null http://example.com; then
-        logger -t passwall-failover "CHECK: site OK (example)"
+        logger -t passwall-failover \
+            "CHECK: site OK (example)"
+
         return 0
     fi
 
-    if wget -4 -q -T 3 -O /dev/null http://detectportal.firefox.com/success.txt; then
-        logger -t passwall-failover "CHECK: site OK (firefox)"
+    if wget -4 -q -T 3 -O /dev/null \
+        http://detectportal.firefox.com/success.txt; then
+
+        logger -t passwall-failover \
+            "CHECK: site OK (firefox)"
+
         return 0
     fi
 
-    if wget -4 -q -T 3 -O /dev/null http://www.msftconnecttest.com/connecttest.txt; then
-        logger -t passwall-failover "CHECK: site OK (msft)"
+    if wget -4 -q -T 3 -O /dev/null \
+        http://www.msftconnecttest.com/connecttest.txt; then
+
+        logger -t passwall-failover \
+            "CHECK: site OK (msft)"
+
         return 0
     fi
 
     logger -t passwall-failover "CHECK: site FAIL"
+
+    return 1
+}
+
+
+# =========================================================
+# MEMORY CHECK
+# =========================================================
+
+check_memory() {
+
+    # =====================================================
+    # MODULE DISABLED
+    # =====================================================
+
+    [ "$ENABLE_MEMORY_CONTROL" != "1" ] && return 0
+
+    # =====================================================
+    # GET AVAILABLE RAM
+    # =====================================================
+    #
+    # Используем MemAvailable из /proc/meminfo
+    #
+    # Это самый надежный и OpenWrt-safe способ.
+    # =====================================================
+
+    AVAILABLE_RAM=$(awk '/MemAvailable/ {
+        printf "%.0f\n", $2 / 1024
+    }' /proc/meminfo)
+
+    # fallback protection
+    [ -z "$AVAILABLE_RAM" ] && AVAILABLE_RAM=0
+
+    logger -t passwall-failover \
+        "MEMORY: available=${AVAILABLE_RAM}MB"
+
+    # =====================================================
+    # MEMORY OK
+    # =====================================================
+
+    if [ "$AVAILABLE_RAM" -ge "$MEMORY_MIN_AVAILABLE" ]; then
+        return 0
+    fi
+
+    logger -t passwall-failover \
+        "MEMORY: LOW RAM detected (${AVAILABLE_RAM}MB)"
+
+    # =====================================================
+    # COOLDOWN PROTECTION
+    # =====================================================
+
+    NOW=$(date +%s)
+    LAST=$(cat "$MEMORY_RESTART_FILE" 2>/dev/null || echo 0)
+
+    if [ $((NOW - LAST)) -lt "$MEMORY_COOLDOWN" ]; then
+
+        logger -t passwall-failover \
+            "MEMORY: cooldown active"
+
+        return 1
+    fi
+
+    echo "$NOW" > "$MEMORY_RESTART_FILE"
+
+    logger -t passwall-failover \
+        "MEMORY: restarting passwall2"
+
+    # =====================================================
+    # SOFT RESTART
+    # =====================================================
+
+    /etc/init.d/passwall2 stop
+
+    sleep 10
+
+    /etc/init.d/passwall2 start
+
+    # =====================================================
+    # RESET COUNTERS
+    # =====================================================
+
+    echo 0 > "$FAIL_FILE"
+    echo 0 > "$OK_FILE"
+
     return 1
 }
 
@@ -252,23 +393,21 @@ restart_passwall() {
     LAST=$(cat "$RESTART_FILE" 2>/dev/null || echo 0)
 
     if [ $((NOW - LAST)) -lt "$RESTART_COOLDOWN" ]; then
-        logger -t passwall-failover "ACTION: restart cooldown active"
+        logger -t passwall-failover \
+            "ACTION: restart cooldown active"
+
         return
     fi
 
     echo "$NOW" > "$RESTART_FILE"
 
-    logger -t passwall-failover "ACTION: restarting passwall2"
+    logger -t passwall-failover \
+        "ACTION: restarting passwall2"
 
-    # 🔥 СБРОС OK ТОЛЬКО ПРИ РЕАЛЬНОМ ACTION
     echo 0 > "$OK_FILE"
 
     ip route flush cache
     echo 1 > /proc/sys/net/ipv4/route/flush
-
-    # =====================================================
-    # SOFT RESTART (LOW MEMORY SAFE)
-    # =====================================================
 
     /etc/init.d/passwall2 stop
 
@@ -291,15 +430,18 @@ switch_node() {
     LAST=$(cat "$RESTART_FILE" 2>/dev/null || echo 0)
 
     if [ $((NOW - LAST)) -lt "$RESTART_COOLDOWN" ]; then
-        logger -t passwall-failover "ACTION: switch cooldown active"
+
+        logger -t passwall-failover \
+            "ACTION: switch cooldown active"
+
         return
     fi
 
     echo "$NOW" > "$RESTART_FILE"
 
-    logger -t passwall-failover "ACTION: switching node to $NODE_NAME ($NODE)"
+    logger -t passwall-failover \
+        "ACTION: switching node to $NODE_NAME ($NODE)"
 
-    # 🔥 СБРОС OK ТОЛЬКО ПРИ РЕАЛЬНОМ FAILOVER
     echo 0 > "$OK_FILE"
 
     uci set passwall2.@global[0].node="$NODE"
@@ -307,10 +449,6 @@ switch_node() {
 
     ip route flush cache
     echo 1 > /proc/sys/net/ipv4/route/flush
-
-    # =====================================================
-    # SOFT RESTART (LOW MEMORY SAFE)
-    # =====================================================
 
     /etc/init.d/passwall2 stop
 
@@ -329,6 +467,19 @@ CURRENT_NODE="$(uci get passwall2.@global[0].node 2>/dev/null)"
 # ОСНОВНАЯ ЛОГИКА
 # =========================================================
 
+# =========================================================
+# LOW MEMORY PROTECTION
+# =========================================================
+#
+# Если был memory restart:
+# - завершаем текущий цикл
+# - избегаем false FAIL / false failover
+# =========================================================
+
+if ! check_memory; then
+    exit 0
+fi
+
 check_internet
 RESULT=$?
 
@@ -340,7 +491,8 @@ case "$RESULT" in
         OK=$(($(cat "$OK_FILE" 2>/dev/null || echo 0) + 1))
         echo "$OK" > "$OK_FILE"
 
-        logger -t passwall-failover "STATE: WAN OK ($OK/$OK_LIMIT), node=$CURRENT_NODE"
+        logger -t passwall-failover \
+            "STATE: WAN OK ($OK/$OK_LIMIT), node=$CURRENT_NODE"
 
         # FAIL COUNTER RESET
         echo 0 > "$FAIL_FILE"
@@ -358,14 +510,21 @@ case "$RESULT" in
 
         if [ "$SITE_RESULT" != "0" ]; then
 
-            SITE_FAIL=$(($(cat "$SITE_FAIL_FILE" 2>/dev/null || echo 0) + 1))
+            SITE_FAIL=$(($(cat "$SITE_FAIL_FILE" \
+                2>/dev/null || echo 0) + 1))
+
             echo "$SITE_FAIL" > "$SITE_FAIL_FILE"
 
-            logger -t passwall-failover "STATE: site FAIL ($SITE_FAIL/$SITE_FAIL_LIMIT)"
+            logger -t passwall-failover \
+                "STATE: site FAIL ($SITE_FAIL/$SITE_FAIL_LIMIT)"
 
             if [ "$SITE_FAIL" -ge "$SITE_FAIL_LIMIT" ]; then
-                logger -t passwall-failover "DECISION: restart passwall after site failures"
+
+                logger -t passwall-failover \
+                    "DECISION: restart passwall after site failures"
+
                 restart_passwall
+
                 echo 0 > "$SITE_FAIL_FILE"
             fi
 
@@ -377,8 +536,12 @@ case "$RESULT" in
         # RETURN TO PRIMARY
         # =================================================
 
-        if [ "$OK" -ge "$OK_LIMIT" ] && [ "$CURRENT_NODE" != "$PRIMARY_NODE" ]; then
-            logger -t passwall-failover "DECISION: return to PRIMARY"
+        if [ "$OK" -ge "$OK_LIMIT" ] && \
+           [ "$CURRENT_NODE" != "$PRIMARY_NODE" ]; then
+
+            logger -t passwall-failover \
+                "DECISION: return to PRIMARY"
+
             switch_node "$PRIMARY_NODE" "$PRIMARY_NODE_NAME"
         fi
         ;;
@@ -388,9 +551,11 @@ case "$RESULT" in
 
         # FAIL COUNTER
         FAIL=$(($(cat "$FAIL_FILE" 2>/dev/null || echo 0) + 1))
+
         echo "$FAIL" > "$FAIL_FILE"
 
-        logger -t passwall-failover "STATE: FAIL ($FAIL/$FAIL_LIMIT), node=$CURRENT_NODE"
+        logger -t passwall-failover \
+            "STATE: FAIL ($FAIL/$FAIL_LIMIT), node=$CURRENT_NODE"
 
         # =================================================
         # CHECK SITE ON BACKUP
@@ -407,14 +572,21 @@ case "$RESULT" in
 
             if [ "$SITE_RESULT" != "0" ]; then
 
-                SITE_FAIL=$(($(cat "$SITE_FAIL_FILE" 2>/dev/null || echo 0) + 1))
+                SITE_FAIL=$(($(cat "$SITE_FAIL_FILE" \
+                    2>/dev/null || echo 0) + 1))
+
                 echo "$SITE_FAIL" > "$SITE_FAIL_FILE"
 
-                logger -t passwall-failover "STATE: site FAIL ($SITE_FAIL/$SITE_FAIL_LIMIT) on BACKUP"
+                logger -t passwall-failover \
+                    "STATE: site FAIL ($SITE_FAIL/$SITE_FAIL_LIMIT) on BACKUP"
 
                 if [ "$SITE_FAIL" -ge "$SITE_FAIL_LIMIT" ]; then
-                    logger -t passwall-failover "DECISION: restart passwall on BACKUP"
+
+                    logger -t passwall-failover \
+                        "DECISION: restart passwall on BACKUP"
+
                     restart_passwall
+
                     echo 0 > "$SITE_FAIL_FILE"
                 fi
 
@@ -427,8 +599,12 @@ case "$RESULT" in
         # FAILOVER
         # =================================================
 
-        if [ "$FAIL" -ge "$FAIL_LIMIT" ] && [ "$CURRENT_NODE" != "$BACKUP_NODE" ]; then
-            logger -t passwall-failover "DECISION: switch to BACKUP"
+        if [ "$FAIL" -ge "$FAIL_LIMIT" ] && \
+           [ "$CURRENT_NODE" != "$BACKUP_NODE" ]; then
+
+            logger -t passwall-failover \
+                "DECISION: switch to BACKUP"
+
             switch_node "$BACKUP_NODE" "$BACKUP_NODE_NAME"
         fi
         ;;
@@ -436,7 +612,8 @@ case "$RESULT" in
 
     2)
 
-        logger -t passwall-failover "STATE: LTE blink detected, counters unchanged"
+        logger -t passwall-failover \
+            "STATE: LTE blink detected, counters unchanged"
         ;;
 
 esac
