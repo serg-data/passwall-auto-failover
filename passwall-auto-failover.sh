@@ -91,7 +91,7 @@ SITE_FAIL_LIMIT=2
 # =========================================================
 
 # ICMP проверки
-ENABLE_ICMP=0
+ENABLE_ICMP=1
 
 # SOCKS/VPN проверки
 ENABLE_SOCKS=1
@@ -173,12 +173,11 @@ fi
 
 check_socks_node() {
 
-    if timeout -s KILL 8 \
-        curl \
+    if curl \
         --socks5-hostname 127.0.0.1:$SOCKS_PORT \
         --connect-timeout 2 \
         --max-time 5 \
-        -I https://cp.cloudflare.com \
+        https://cp.cloudflare.com \
         >/dev/null 2>&1; then
 
         logger -t passwall-failover "CHECK: SOCKS node OK"
