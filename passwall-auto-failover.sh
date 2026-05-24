@@ -48,9 +48,12 @@ trap cleanup EXIT INT TERM
 #
 # - при switch_node()
 # - при restart_passwall()
-# - при memory recovery
+# FAIL счетчик НЕ сбрасывается
 #
-# Это намного стабильнее для LTE/VPN.
+# после memory recovery restart.
+#
+# Это позволяет failover progression
+# продолжаться после recovery.
 # =========================================================
 #
 # 📝 Редактировать:
@@ -121,12 +124,18 @@ ENABLE_SITE=1
 ENABLE_MEMORY_CONTROL=1
 
 # Минимум available RAM в MB
-MEMORY_MIN_AVAILABLE=15
+MEMORY_MIN_AVAILABLE=20
 
 # cooldown между memory restart
 MEMORY_COOLDOWN=300
 
 MEMORY_RESTART_FILE="/tmp/passwall_memory_restart"
+
+# Счетчик memory recovery циклов
+MEMORY_RECOVERY_COUNT_FILE="/tmp/passwall_memory_recovery.count"
+
+# Счетчик uptime циклов
+UPTIME_CYCLE_FILE="/tmp/passwall_uptime_cycles"
 
 
 # =========================================================
@@ -371,14 +380,31 @@ check_memory() {
 
     /etc/init.d/passwall2 start
 
-    # =====================================================
-    # RESET COUNTERS
-    # =====================================================
+    # Сбрасываем uptime cycle counter
+    echo 0 > "$UPTIME_CYCLE_FILE"
 
-    echo 0 > "$FAIL_FILE"
-    echo 0 > "$OK_FILE"
+# =====================================================
+# MEMORY RECOVERY COUNTER
+# =====================================================
+#
+# FAIL/OK counters НЕ сбрасываем.
+#
+# Это позволяет failover progression
+# продолжаться после memory recovery.
+#
+# Отдельно ведем счетчик memory recovery циклов.
+# =====================================================
 
-    return 1
+RECOVERY_COUNT=$(($(cat \
+    "$MEMORY_RECOVERY_COUNT_FILE" \
+    2>/dev/null || echo 0) + 1))
+
+echo "$RECOVERY_COUNT" > "$MEMORY_RECOVERY_COUNT_FILE"
+
+logger -t passwall-failover \
+    "MEMORY: recovery cycle #$RECOVERY_COUNT"
+
+return 1
 }
 
 
@@ -404,6 +430,7 @@ restart_passwall() {
         "ACTION: restarting passwall2"
 
     echo 0 > "$OK_FILE"
+    echo 0 > "$MEMORY_RECOVERY_COUNT_FILE"
 
     ip route flush cache
     echo 1 > /proc/sys/net/ipv4/route/flush
@@ -442,6 +469,7 @@ switch_node() {
         "ACTION: switching node to $NODE_NAME ($NODE)"
 
     echo 0 > "$OK_FILE"
+    echo 0 > "$MEMORY_RECOVERY_COUNT_FILE"
 
     uci set passwall2.@global[0].node="$NODE"
     uci commit passwall2
@@ -478,6 +506,18 @@ CURRENT_NODE="$(uci get passwall2.@global[0].node 2>/dev/null)"
 if ! check_memory; then
     exit 0
 fi
+
+# =========================================================
+# UPTIME CYCLE COUNTER
+# =========================================================
+
+UPTIME_CYCLE=$(($(cat "$UPTIME_CYCLE_FILE" \
+    2>/dev/null || echo 0) + 1))
+
+echo "$UPTIME_CYCLE" > "$UPTIME_CYCLE_FILE"
+
+logger -t passwall-failover \
+    "STATE: uptime cycle #$UPTIME_CYCLE"
 
 check_internet
 RESULT=$?
