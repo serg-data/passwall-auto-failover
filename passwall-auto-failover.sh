@@ -177,6 +177,49 @@ fi
 
 
 # =========================================================
+# WAIT XRAY STOP
+# =========================================================
+#
+# Во время failover/switch:
+#
+# - старый xray может еще держать heap
+# - transport может еще закрываться
+# - sockets могут быть в cleanup
+#
+# На low RAM роутерах это может вызвать:
+#
+# old xray heap + new xray heap = memory spike
+#
+# Поэтому ждем ПОЛНОГО завершения xray
+# перед новым стартом passwall2.
+# =========================================================
+
+wait_xray_stop() {
+
+    for i in $(seq 1 30); do
+
+        if ! pidof xray >/dev/null; then
+
+            logger -t passwall-failover \
+                "WAIT: xray fully stopped"
+
+            break
+        fi
+
+        logger -t passwall-failover \
+            "WAIT: xray still stopping..."
+
+        sleep 1
+    done
+
+    # Дополнительная пауза для cleanup:
+    # sockets / routes / nft / transport buffers
+
+    sleep 3
+}
+
+
+# =========================================================
 # SOCKS / VPN CHECK
 # =========================================================
 
@@ -314,34 +357,16 @@ check_site() {
 
 check_memory() {
 
-    # =====================================================
-    # MODULE DISABLED
-    # =====================================================
-
     [ "$ENABLE_MEMORY_CONTROL" != "1" ] && return 0
-
-    # =====================================================
-    # GET AVAILABLE RAM
-    # =====================================================
-    #
-    # Используем MemAvailable из /proc/meminfo
-    #
-    # Это самый надежный и OpenWrt-safe способ.
-    # =====================================================
 
     AVAILABLE_RAM=$(awk '/MemAvailable/ {
         printf "%.0f\n", $2 / 1024
     }' /proc/meminfo)
 
-    # fallback protection
     [ -z "$AVAILABLE_RAM" ] && AVAILABLE_RAM=0
 
     logger -t passwall-failover \
         "MEMORY: available=${AVAILABLE_RAM}MB"
-
-    # =====================================================
-    # MEMORY OK
-    # =====================================================
 
     if [ "$AVAILABLE_RAM" -ge "$MEMORY_MIN_AVAILABLE" ]; then
         return 0
@@ -349,10 +374,6 @@ check_memory() {
 
     logger -t passwall-failover \
         "MEMORY: LOW RAM detected (${AVAILABLE_RAM}MB)"
-
-    # =====================================================
-    # COOLDOWN PROTECTION
-    # =====================================================
 
     NOW=$(date +%s)
     LAST=$(cat "$MEMORY_RESTART_FILE" 2>/dev/null || echo 0)
@@ -370,41 +391,24 @@ check_memory() {
     logger -t passwall-failover \
         "MEMORY: restarting passwall2"
 
-    # =====================================================
-    # SOFT RESTART
-    # =====================================================
-
     /etc/init.d/passwall2 stop
 
-    sleep 10
+    wait_xray_stop
 
     /etc/init.d/passwall2 start
 
-    # Сбрасываем uptime cycle counter
     echo 0 > "$UPTIME_CYCLE_FILE"
 
-# =====================================================
-# MEMORY RECOVERY COUNTER
-# =====================================================
-#
-# FAIL/OK counters НЕ сбрасываем.
-#
-# Это позволяет failover progression
-# продолжаться после memory recovery.
-#
-# Отдельно ведем счетчик memory recovery циклов.
-# =====================================================
+    RECOVERY_COUNT=$(($(cat \
+        "$MEMORY_RECOVERY_COUNT_FILE" \
+        2>/dev/null || echo 0) + 1))
 
-RECOVERY_COUNT=$(($(cat \
-    "$MEMORY_RECOVERY_COUNT_FILE" \
-    2>/dev/null || echo 0) + 1))
+    echo "$RECOVERY_COUNT" > "$MEMORY_RECOVERY_COUNT_FILE"
 
-echo "$RECOVERY_COUNT" > "$MEMORY_RECOVERY_COUNT_FILE"
+    logger -t passwall-failover \
+        "MEMORY: recovery cycle #$RECOVERY_COUNT"
 
-logger -t passwall-failover \
-    "MEMORY: recovery cycle #$RECOVERY_COUNT"
-
-return 1
+    return 1
 }
 
 
@@ -437,7 +441,7 @@ restart_passwall() {
 
     /etc/init.d/passwall2 stop
 
-    sleep 8
+    wait_xray_stop
 
     /etc/init.d/passwall2 start
 }
@@ -479,7 +483,7 @@ switch_node() {
 
     /etc/init.d/passwall2 stop
 
-    sleep 8
+    wait_xray_stop
 
     /etc/init.d/passwall2 start
 
@@ -494,22 +498,9 @@ CURRENT_NODE="$(uci get passwall2.@global[0].node 2>/dev/null)"
 # ОСНОВНАЯ ЛОГИКА
 # =========================================================
 
-# =========================================================
-# LOW MEMORY PROTECTION
-# =========================================================
-#
-# Если был memory restart:
-# - завершаем текущий цикл
-# - избегаем false FAIL / false failover
-# =========================================================
-
 if ! check_memory; then
     exit 0
 fi
-
-# =========================================================
-# UPTIME CYCLE COUNTER
-# =========================================================
 
 UPTIME_CYCLE=$(($(cat "$UPTIME_CYCLE_FILE" \
     2>/dev/null || echo 0) + 1))
@@ -526,19 +517,13 @@ case "$RESULT" in
 
     0)
 
-        # SUCCESS COUNTER
         OK=$(($(cat "$OK_FILE" 2>/dev/null || echo 0) + 1))
         echo "$OK" > "$OK_FILE"
 
         logger -t passwall-failover \
             "STATE: WAN OK ($OK/$OK_LIMIT), node=$CURRENT_NODE"
 
-        # FAIL COUNTER RESET
         echo 0 > "$FAIL_FILE"
-
-        # =================================================
-        # SITE CHECK
-        # =================================================
 
         if [ "$ENABLE_SITE" = "1" ]; then
             check_site
@@ -571,10 +556,6 @@ case "$RESULT" in
             echo 0 > "$SITE_FAIL_FILE"
         fi
 
-        # =================================================
-        # RETURN TO PRIMARY
-        # =================================================
-
         if [ "$OK" -ge "$OK_LIMIT" ] && \
            [ "$CURRENT_NODE" != "$PRIMARY_NODE" ]; then
 
@@ -588,17 +569,12 @@ case "$RESULT" in
 
     1)
 
-        # FAIL COUNTER
         FAIL=$(($(cat "$FAIL_FILE" 2>/dev/null || echo 0) + 1))
 
         echo "$FAIL" > "$FAIL_FILE"
 
         logger -t passwall-failover \
             "STATE: FAIL ($FAIL/$FAIL_LIMIT), node=$CURRENT_NODE"
-
-        # =================================================
-        # CHECK SITE ON BACKUP
-        # =================================================
 
         if [ "$CURRENT_NODE" = "$BACKUP_NODE" ]; then
 
@@ -633,10 +609,6 @@ case "$RESULT" in
                 echo 0 > "$SITE_FAIL_FILE"
             fi
         fi
-
-        # =================================================
-        # FAILOVER
-        # =================================================
 
         if [ "$FAIL" -ge "$FAIL_LIMIT" ] && \
            [ "$CURRENT_NODE" != "$BACKUP_NODE" ]; then
