@@ -30,43 +30,21 @@ trap cleanup EXIT INT TERM
 # =========================================================
 # Passwall2 Auto Failover (OpenWrt)
 #
-# Особенности логики:
+# Универсальный failover:
 #
-#  ICMP можно отключать
-#  SOCKS проверяет реальную работу VPN
-#  SITE проверяет открытие сайтов
-#  MEMORY CHECK контролирует low RAM
-#  Защита от restart storm
-#  FAIL_LIMIT защищает от LTE jitter
+# - sing-box
+# - xray
 #
-# 🔥 ВАЖНО:
+# Поддерживает:
 #
-# OK счетчик НЕ сбрасывается
-# при кратковременных FAIL.
+# ICMP checks
+# SOCKS checks
+# SITE checks
+# MEMORY watchdog
+# LTE blink protection
+# restart cooldown
+# failover progression
 #
-# OK сбрасывается ТОЛЬКО:
-#
-# - при switch_node()
-# - при restart_passwall()
-# FAIL счетчик НЕ сбрасывается
-#
-# после memory recovery restart.
-#
-# Это позволяет failover progression
-# продолжаться после recovery.
-# =========================================================
-#
-# 📝 Редактировать:
-#   vi /usr/bin/passwall-auto-failover.sh
-#
-# 🔐 Права:
-#   chmod +x /usr/bin/passwall-auto-failover.sh
-#
-# ⏱ Cron:
-#   */2 * * * * /usr/bin/passwall-auto-failover.sh
-#
-# 📜 Логи:
-#   logread | grep passwall-failover
 # =========================================================
 
 
@@ -77,64 +55,72 @@ trap cleanup EXIT INT TERM
 PRIMARY_NODE_NAME="Shunt"
 BACKUP_NODE_NAME="ShuntWhiteList"
 
-LTE_MODE=1
-
-FAIL_LIMIT=3
+FAIL_LIMIT=1
 OK_LIMIT=3
 
 FAIL_FILE="/tmp/passwall_fail.count"
 OK_FILE="/tmp/passwall_ok.count"
 
 SITE_FAIL_FILE="/tmp/passwall_site_fail.count"
-SITE_FAIL_LIMIT=2
+SITE_FAIL_LIMIT=1
+
+
+# =========================================================
+# INTERFACE SETTINGS
+# =========================================================
+#
+# ICMP проверки идут ИМЕННО через этот интерфейс.
+#
+# Примеры:
+#
+# wan        -> ethernet WAN
+# wwan       -> logical WWAN
+# phy5-sta0  -> реальное Wi-Fi client устройство
+# usb0       -> USB tether/modem
+#
+# ВАЖНО:
+#
+# Для Wi-Fi client лучше использовать
+# реальное устройство:
+#
+# phyX-sta0
+#
+# потому что wwan иногда не подходит
+# для ping -I.
+# =========================================================
+
+CHECK_INTERFACE="wan"
 
 
 # =========================================================
 # ENABLE / DISABLE CHECKS
 # =========================================================
 
-# ICMP проверки
 ENABLE_ICMP=1
-
-# SOCKS/VPN проверки
 ENABLE_SOCKS=1
-
-# Проверка открытия сайтов
 ENABLE_SITE=1
+
+
+# =========================================================
+# LTE MODE
+# =========================================================
+
+LTE_MODE=1
 
 
 # =========================================================
 # MEMORY CONTROL
 # =========================================================
-#
-# Полностью отключаемый memory watchdog.
-#
-# ENABLE_MEMORY_CONTROL=0
-#
-# Используется MemAvailable из /proc/meminfo
-# (самый правильный вариант для OpenWrt)
-#
-# Recommended:
-#
-# 64MB RAM  -> 5-8MB
-# 128MB RAM -> 8-12MB
-# 256MB RAM -> 10-20MB
-# =========================================================
 
 ENABLE_MEMORY_CONTROL=1
 
-# Минимум available RAM в MB
-MEMORY_MIN_AVAILABLE=20
-
-# cooldown между memory restart
+MEMORY_MIN_AVAILABLE=25
 MEMORY_COOLDOWN=300
 
 MEMORY_RESTART_FILE="/tmp/passwall_memory_restart"
 
-# Счетчик memory recovery циклов
 MEMORY_RECOVERY_COUNT_FILE="/tmp/passwall_memory_recovery.count"
 
-# Счетчик uptime циклов
 UPTIME_CYCLE_FILE="/tmp/passwall_uptime_cycles"
 
 
@@ -150,7 +136,44 @@ SOCKS_PORT="1082"
 # =========================================================
 
 RESTART_COOLDOWN=120
+
 RESTART_FILE="/tmp/passwall_last_restart"
+
+
+# =========================================================
+# REAL WAN CHECK
+# =========================================================
+#
+# Проверяет:
+# жив ли физически WAN/LTE.
+#
+# ВАЖНО:
+#
+# НЕ проверяет обычный интернет.
+#
+# Используется whitelist IP,
+# доступный даже во время shutdown.
+#
+# Это позволяет:
+#
+# - отличить shutdown от dead WAN
+# - не ломать backup whitelist node
+# - остановить recovery storm
+# - защитить RAM/xray/swap
+#
+# Можно отключить:
+#
+# ENABLE_REAL_WAN_CHECK=0
+# =========================================================
+
+ENABLE_REAL_WAN_CHECK=1
+
+REAL_WAN_IP="77.88.8.8"
+
+# cooldown при dead WAN
+REAL_WAN_FAIL_COOLDOWN=300
+
+REAL_WAN_FAIL_FILE="/tmp/passwall_real_wan_fail"
 
 
 # =========================================================
@@ -171,78 +194,110 @@ PRIMARY_NODE=$(get_node_id_by_name "$PRIMARY_NODE_NAME")
 BACKUP_NODE=$(get_node_id_by_name "$BACKUP_NODE_NAME")
 
 if [ -z "$PRIMARY_NODE" ] || [ -z "$BACKUP_NODE" ]; then
+
     logger -t passwall-failover "ERROR: node not found"
+
     exit 1
 fi
 
 
 # =========================================================
-# WAIT XRAY STOP
-# =========================================================
-#
-# Во время failover/switch:
-#
-# - старый xray может еще держать heap
-# - transport может еще закрываться
-# - sockets могут быть в cleanup
-#
-# На low RAM роутерах это может вызвать:
-#
-# old xray heap + new xray heap = memory spike
-#
-# Поэтому ждем ПОЛНОГО завершения xray
-# перед новым стартом passwall2.
+# WAIT PROXY CORE STOP
 # =========================================================
 
-wait_xray_stop() {
+wait_core_stop() {
 
     for i in $(seq 1 30); do
 
-        if ! pidof xray >/dev/null; then
+        XRAY_RUNNING=0
+        SING_RUNNING=0
+
+        pidof xray >/dev/null 2>&1 && XRAY_RUNNING=1
+        pidof sing-box >/dev/null 2>&1 && SING_RUNNING=1
+
+        if [ "$XRAY_RUNNING" = "0" ] && \
+           [ "$SING_RUNNING" = "0" ]; then
 
             logger -t passwall-failover \
-                "WAIT: xray fully stopped"
+                "WAIT: proxy core fully stopped"
 
             break
         fi
 
         logger -t passwall-failover \
-            "WAIT: xray still stopping..."
+            "WAIT: proxy core still stopping..."
 
         sleep 1
     done
 
-    # Дополнительная пауза для cleanup:
-    # sockets / routes / nft / transport buffers
-
     sleep 3
+
+    if pidof sing-box >/dev/null 2>&1; then
+
+        logger -t passwall-failover \
+            "WAIT: force killing stuck sing-box"
+
+        killall -9 sing-box 2>/dev/null
+    fi
 }
 
 
 # =========================================================
-# SOCKS / VPN CHECK
+# REAL WAN CHECK
 # =========================================================
 
-check_socks_node() {
+check_real_wan() {
 
-    if curl \
-        --socks5-hostname 127.0.0.1:$SOCKS_PORT \
-        --connect-timeout 2 \
-        --max-time 5 \
-        https://cp.cloudflare.com \
+    [ "$ENABLE_REAL_WAN_CHECK" != "1" ] && return 0
+
+    if ping -I "$CHECK_INTERFACE" \
+        -c 1 -W 3 "$REAL_WAN_IP" \
         >/dev/null 2>&1; then
 
-        logger -t passwall-failover "CHECK: SOCKS node OK"
+        logger -t passwall-failover \
+            "CHECK: real WAN OK"
+
         return 0
     fi
 
-    logger -t passwall-failover "CHECK: SOCKS node FAIL"
+    logger -t passwall-failover \
+        "CHECK: real WAN FAIL"
+
     return 1
 }
 
 
 # =========================================================
-# ПРОВЕРКА WAN
+# SOCKS CHECK
+# =========================================================
+
+check_socks_node() {
+
+    if timeout -s KILL 8 \
+        curl \
+        --ipv4 \
+        --socks5-hostname 127.0.0.1:$SOCKS_PORT \
+        --connect-timeout 2 \
+        --max-time 5 \
+        --no-keepalive \
+        https://cp.cloudflare.com \
+        >/dev/null 2>&1; then
+
+        logger -t passwall-failover \
+            "CHECK: SOCKS node OK"
+
+        return 0
+    fi
+
+    logger -t passwall-failover \
+        "CHECK: SOCKS node FAIL"
+
+    return 1
+}
+
+
+# =========================================================
+# INTERNET CHECK
 # =========================================================
 
 check_internet() {
@@ -254,6 +309,7 @@ check_internet() {
     if [ "$LTE_MODE" = "1" ]; then
 
         if ! ip route | grep -q '^default'; then
+
             logger -t passwall-failover \
                 "CHECK: no default route (LTE blink)"
 
@@ -267,23 +323,39 @@ check_internet() {
 
     if [ "$ENABLE_ICMP" = "1" ]; then
 
-        if ping -I wan -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then
-            logger -t passwall-failover "CHECK: ICMP 1.1.1.1 OK"
+        if ping -I "$CHECK_INTERFACE" \
+            -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then
+
+            logger -t passwall-failover \
+                "CHECK: ICMP 1.1.1.1 OK"
+
             return 0
         fi
 
-        if ping -I wan -c 1 -W 2 9.9.9.9 >/dev/null 2>&1; then
-            logger -t passwall-failover "CHECK: ICMP 9.9.9.9 OK"
+        if ping -I "$CHECK_INTERFACE" \
+            -c 1 -W 2 9.9.9.9 >/dev/null 2>&1; then
+
+            logger -t passwall-failover \
+                "CHECK: ICMP 9.9.9.9 OK"
+
             return 0
         fi
 
-        if ping -I wan -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
-            logger -t passwall-failover "CHECK: ICMP 8.8.8.8 OK"
+        if ping -I "$CHECK_INTERFACE" \
+            -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+
+            logger -t passwall-failover \
+                "CHECK: ICMP 8.8.8.8 OK"
+
             return 0
         fi
 
-        if ping -I wan -c 1 -W 2 208.67.222.222 >/dev/null 2>&1; then
-            logger -t passwall-failover "CHECK: ICMP OpenDNS OK"
+        if ping -I "$CHECK_INTERFACE" \
+            -c 1 -W 2 208.67.222.222 >/dev/null 2>&1; then
+
+            logger -t passwall-failover \
+                "CHECK: ICMP OpenDNS OK"
+
             return 0
         fi
 
@@ -297,9 +369,11 @@ check_internet() {
 
     if [ "$ENABLE_SOCKS" = "1" ]; then
 
-        logger -t passwall-failover "CHECK: trying SOCKS"
+        logger -t passwall-failover \
+            "CHECK: trying SOCKS"
 
         if check_socks_node; then
+
             logger -t passwall-failover \
                 "CHECK: SOCKS fallback OK"
 
@@ -321,6 +395,7 @@ check_internet() {
 check_site() {
 
     if wget -4 -q -T 3 -O /dev/null http://example.com; then
+
         logger -t passwall-failover \
             "CHECK: site OK (example)"
 
@@ -345,7 +420,8 @@ check_site() {
         return 0
     fi
 
-    logger -t passwall-failover "CHECK: site FAIL"
+    logger -t passwall-failover \
+        "CHECK: site FAIL"
 
     return 1
 }
@@ -393,7 +469,9 @@ check_memory() {
 
     /etc/init.d/passwall2 stop
 
-    wait_xray_stop
+    wait_core_stop
+
+    rm -f /tmp/etc/passwall2/*.json
 
     /etc/init.d/passwall2 start
 
@@ -403,7 +481,8 @@ check_memory() {
         "$MEMORY_RECOVERY_COUNT_FILE" \
         2>/dev/null || echo 0) + 1))
 
-    echo "$RECOVERY_COUNT" > "$MEMORY_RECOVERY_COUNT_FILE"
+    echo "$RECOVERY_COUNT" > \
+        "$MEMORY_RECOVERY_COUNT_FILE"
 
     logger -t passwall-failover \
         "MEMORY: recovery cycle #$RECOVERY_COUNT"
@@ -422,6 +501,7 @@ restart_passwall() {
     LAST=$(cat "$RESTART_FILE" 2>/dev/null || echo 0)
 
     if [ $((NOW - LAST)) -lt "$RESTART_COOLDOWN" ]; then
+
         logger -t passwall-failover \
             "ACTION: restart cooldown active"
 
@@ -441,7 +521,9 @@ restart_passwall() {
 
     /etc/init.d/passwall2 stop
 
-    wait_xray_stop
+    wait_core_stop
+
+    rm -f /tmp/etc/passwall2/*.json
 
     /etc/init.d/passwall2 start
 }
@@ -483,7 +565,9 @@ switch_node() {
 
     /etc/init.d/passwall2 stop
 
-    wait_xray_stop
+    wait_core_stop
+
+    rm -f /tmp/etc/passwall2/*.json
 
     /etc/init.d/passwall2 start
 
@@ -495,7 +579,7 @@ CURRENT_NODE="$(uci get passwall2.@global[0].node 2>/dev/null)"
 
 
 # =========================================================
-# ОСНОВНАЯ ЛОГИКА
+# MAIN LOGIC
 # =========================================================
 
 if ! check_memory; then
@@ -518,6 +602,7 @@ case "$RESULT" in
     0)
 
         OK=$(($(cat "$OK_FILE" 2>/dev/null || echo 0) + 1))
+
         echo "$OK" > "$OK_FILE"
 
         logger -t passwall-failover \
@@ -577,6 +662,46 @@ case "$RESULT" in
             "STATE: FAIL ($FAIL/$FAIL_LIMIT), node=$CURRENT_NODE"
 
         if [ "$CURRENT_NODE" = "$BACKUP_NODE" ]; then
+
+            # =============================================
+            # REAL WAN PROTECTION
+            # =============================================
+            #
+            # Если физически умер WAN/LTE:
+            #
+            # - НЕ запускаем recovery storm
+            # - НЕ restart loop passwall
+            # - НЕ душим RAM/xray/swap
+            #
+            # ВАЖНО:
+            #
+            # НЕ ломает shutdown detection,
+            # потому что whitelist IP
+            # доступен во время shutdown.
+            # =============================================
+
+            if ! check_real_wan; then
+
+                NOW=$(date +%s)
+                LAST=$(cat "$REAL_WAN_FAIL_FILE" \
+                    2>/dev/null || echo 0)
+
+                if [ $((NOW - LAST)) -lt \
+                    "$REAL_WAN_FAIL_COOLDOWN" ]; then
+
+                    logger -t passwall-failover \
+                        "STATE: WAN cooldown active"
+
+                    exit 0
+                fi
+
+                echo "$NOW" > "$REAL_WAN_FAIL_FILE"
+
+                logger -t passwall-failover \
+                    "STATE: real WAN dead, skipping recovery"
+
+                exit 0
+            fi
 
             if [ "$ENABLE_SITE" = "1" ]; then
                 check_site
