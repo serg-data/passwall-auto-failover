@@ -62,7 +62,22 @@ FAIL_FILE="/tmp/passwall_fail.count"
 OK_FILE="/tmp/passwall_ok.count"
 
 SITE_FAIL_FILE="/tmp/passwall_site_fail.count"
-SITE_FAIL_LIMIT=1
+
+# =========================================================
+# SITE FAIL LIMIT
+# =========================================================
+#
+# Проверка сайтов может иногда фейлиться:
+#
+# - LTE reconnect
+# - DNS rebuild
+# - shunt recovery
+# - временные route delay
+#
+# Поэтому 2 безопаснее чем 1.
+# =========================================================
+
+SITE_FAIL_LIMIT=2
 
 
 # =========================================================
@@ -204,6 +219,21 @@ fi
 # =========================================================
 # WAIT PROXY CORE STOP
 # =========================================================
+#
+# Ждём graceful shutdown:
+#
+# - xray
+# - sing-box
+#
+# БЕЗ force kill.
+#
+# Это безопаснее для:
+#
+# - shunt rules
+# - nft state
+# - routing consistency
+# - dns rules
+# =========================================================
 
 wait_core_stop() {
 
@@ -230,15 +260,7 @@ wait_core_stop() {
         sleep 1
     done
 
-    sleep 3
-
-    if pidof sing-box >/dev/null 2>&1; then
-
-        logger -t passwall-failover \
-            "WAIT: force killing stuck sing-box"
-
-        killall -9 sing-box 2>/dev/null
-    fi
+    sleep 5
 }
 
 
@@ -394,7 +416,8 @@ check_internet() {
 
 check_site() {
 
-    if wget -4 -q -T 3 -O /dev/null http://example.com; then
+    if wget -4 -q -T 5 -O /dev/null \
+        http://example.com; then
 
         logger -t passwall-failover \
             "CHECK: site OK (example)"
@@ -402,7 +425,7 @@ check_site() {
         return 0
     fi
 
-    if wget -4 -q -T 3 -O /dev/null \
+    if wget -4 -q -T 5 -O /dev/null \
         http://detectportal.firefox.com/success.txt; then
 
         logger -t passwall-failover \
@@ -411,7 +434,7 @@ check_site() {
         return 0
     fi
 
-    if wget -4 -q -T 3 -O /dev/null \
+    if wget -4 -q -T 5 -O /dev/null \
         http://www.msftconnecttest.com/connecttest.txt; then
 
         logger -t passwall-failover \
@@ -471,8 +494,6 @@ check_memory() {
 
     wait_core_stop
 
-    rm -f /tmp/etc/passwall2/*.json
-
     /etc/init.d/passwall2 start
 
     echo 0 > "$UPTIME_CYCLE_FILE"
@@ -523,8 +544,6 @@ restart_passwall() {
 
     wait_core_stop
 
-    rm -f /tmp/etc/passwall2/*.json
-
     /etc/init.d/passwall2 start
 }
 
@@ -566,8 +585,6 @@ switch_node() {
     /etc/init.d/passwall2 stop
 
     wait_core_stop
-
-    rm -f /tmp/etc/passwall2/*.json
 
     /etc/init.d/passwall2 start
 
@@ -666,19 +683,6 @@ case "$RESULT" in
             # =============================================
             # REAL WAN PROTECTION
             # =============================================
-            #
-            # Если физически умер WAN/LTE:
-            #
-            # - НЕ запускаем recovery storm
-            # - НЕ restart loop passwall
-            # - НЕ душим RAM/xray/swap
-            #
-            # ВАЖНО:
-            #
-            # НЕ ломает shutdown detection,
-            # потому что whitelist IP
-            # доступен во время shutdown.
-            # =============================================
 
             if ! check_real_wan; then
 
@@ -723,9 +727,7 @@ case "$RESULT" in
                 if [ "$SITE_FAIL" -ge "$SITE_FAIL_LIMIT" ]; then
 
                     logger -t passwall-failover \
-                        "DECISION: restart passwall on BACKUP"
-
-                    restart_passwall
+                        "STATE: skipping site recovery on BACKUP"
 
                     echo 0 > "$SITE_FAIL_FILE"
                 fi
