@@ -111,7 +111,7 @@ CHECK_INTERFACE="wan"
 # ENABLE / DISABLE CHECKS
 # =========================================================
 
-ENABLE_ICMP=1
+ENABLE_ICMP=0
 ENABLE_SOCKS=1
 ENABLE_SITE=1
 
@@ -295,14 +295,13 @@ check_real_wan() {
 
 check_socks_node() {
 
-    if timeout -s KILL 8 \
-        curl \
+    if curl \
         --ipv4 \
         --socks5-hostname 127.0.0.1:$SOCKS_PORT \
-        --connect-timeout 2 \
-        --max-time 5 \
+        --connect-timeout 4 \
+        --max-time 10 \
         --no-keepalive \
-        https://cp.cloudflare.com \
+        http://cp.cloudflare.com \
         >/dev/null 2>&1; then
 
         logger -t passwall-failover \
