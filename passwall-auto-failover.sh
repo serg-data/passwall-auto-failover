@@ -111,7 +111,7 @@ CHECK_INTERFACE="wan"
 # ENABLE / DISABLE CHECKS
 # =========================================================
 
-ENABLE_ICMP=0
+ENABLE_ICMP=1
 ENABLE_SOCKS=1
 ENABLE_SITE=1
 
