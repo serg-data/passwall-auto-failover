@@ -72,8 +72,17 @@ DNS_FAIL_LIMIT=2
 CHECK_INTERFACE="wan"
 
 ENABLE_ICMP=1
-ENABLE_SOCKS=1
+ENABLE_SOCKS=0
+ENABLE_TCP_FALLBACK=1
 ENABLE_DNS_CHECK=1
+
+# =========================================================
+# TCP FALLBACK
+# =========================================================
+
+TCP_FALLBACK_HOST="premium-ru.geodema.network"
+TCP_FALLBACK_PORT="443"
+TCP_FALLBACK_TIMEOUT="3"
 
 LTE_MODE=1
 
@@ -376,24 +385,61 @@ check_internet() {
 
     if [ "$ENABLE_SOCKS" = "1" ]; then
 
+    logger -t passwall-failover \
+        "CHECK: trying SOCKS"
+
+    if check_socks_node; then
+
         logger -t passwall-failover \
-            "CHECK: trying SOCKS"
+            "CHECK: SOCKS fallback OK"
 
-        if check_socks_node; then
+        return 0
+    fi
+fi
 
-            logger -t passwall-failover \
-                "CHECK: SOCKS fallback OK"
+if [ "$ENABLE_TCP_FALLBACK" = "1" ]; then
 
-            return 0
-        fi
+    logger -t passwall-failover \
+        "CHECK: trying TCP fallback"
+
+    if check_tcp_fallback; then
+
+        return 0
+    fi
+fi
+
+logger -t passwall-failover \
+    "CHECK: FAIL (all enabled checks failed)"
+
+return 1
+}
+
+
+# =========================================================
+# TCP FALLBACK (через интерфейс из переменной)
+# =========================================================
+
+check_tcp_fallback() {
+    if curl \
+        --interface "$CHECK_INTERFACE" \
+        -k \
+        -I \
+        --connect-timeout "$TCP_FALLBACK_TIMEOUT" \
+        --max-time 5 \
+        https://$TCP_FALLBACK_HOST \
+        >/dev/null 2>&1; then
+
+        logger -t passwall-failover \
+            "CHECK: TCP fallback OK ($TCP_FALLBACK_HOST via $CHECK_INTERFACE)"
+
+        return 0
     fi
 
     logger -t passwall-failover \
-        "CHECK: FAIL (all enabled checks failed)"
+        "CHECK: TCP fallback FAIL ($TCP_FALLBACK_HOST via $CHECK_INTERFACE)"
 
     return 1
 }
-
 
 # =========================================================
 # DNS CHECK
@@ -695,13 +741,37 @@ if [ "$DNS_RESULT" != "0" ]; then
 
     if [ "$DNS_FAIL" -ge "$DNS_FAIL_LIMIT" ]; then
 
+    DNS_BLOCKED=0
+
+    if [ "$CURRENT_NODE" = "$BACKUP_NODE" ]; then
+
+        if ! check_real_wan; then
+
+            NOW=$(date +%s)
+            LAST=$(cat "$REAL_WAN_FAIL_FILE" \
+                2>/dev/null || echo 0)
+
+            if [ $((NOW - LAST)) -lt \
+                "$REAL_WAN_FAIL_COOLDOWN" ]; then
+
+                logger -t passwall-failover \
+                    "DNS: WAN cooldown active, restart skipped"
+
+                DNS_BLOCKED=1
+            fi
+        fi
+    fi
+
+    if [ "$DNS_BLOCKED" = "0" ]; then
+
         logger -t passwall-failover \
             "DECISION: restart passwall after DNS failures"
 
         restart_passwall
-
-        echo 0 > "$DNS_FAIL_FILE"
     fi
+
+    echo 0 > "$DNS_FAIL_FILE"
+fi
 
 else
 
