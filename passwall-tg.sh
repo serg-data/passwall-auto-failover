@@ -1,7 +1,7 @@
 #!/bin/sh
 
-BOT_TOKEN="8472993466:AAEelwencKR-V582TdqIZqVDKH54nJFtsTw"
-CHAT_ID="880795265"
+BOT_TOKEN=".........."
+CHAT_ID="........."
 
 ROUTER_ID="$(cat /etc/myvpn-id 2>/dev/null || echo OpenWrt)"
 
