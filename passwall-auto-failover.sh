@@ -1,5 +1,45 @@
 #!/bin/sh
 
+# =========================================================
+# REQUIREMENTS
+# =========================================================
+#
+# Required packages:
+#
+#   curl
+#     Used for TCP fallback checks.
+#
+#   ip-full
+#     Required for:
+#       ip route
+#       ip route flush cache
+#
+#   coreutils-find
+#     Required for:
+#       find -mmin
+#
+# OpenWrt built-in tools used:
+#
+#   ping
+#   logger
+#   awk
+#   grep
+#   cut
+#   cat
+#   date
+#   sleep
+#   pidof
+#   nslookup
+#   uci
+#
+# Tested on:
+#
+#   OpenWrt
+#   Passwall2
+#   Xray / Sing-box
+#
+# =========================================================
+
 LOCKDIR="/tmp/passwall-auto-failover.lock"
 
 # =========================================================
@@ -324,6 +364,35 @@ check_socks_node() {
 }
 
 
+get_random_icmp() {
+    local LAST_FILE="/tmp/passwall-last-icmp"
+    local IPS="1.1.1.1 9.9.9.9 8.8.8.8 208.67.222.222"
+
+    local LAST="$(cat "$LAST_FILE" 2>/dev/null)"
+
+    local LIST=""
+    local COUNT=0
+
+    for ip in $IPS; do
+        [ "$ip" != "$LAST" ] && {
+            LIST="$LIST $ip"
+            COUNT=$((COUNT + 1))
+        }
+    done
+
+    local IDX=$((RANDOM % COUNT + 1))
+    local N=1
+
+    for ip in $LIST; do
+        if [ "$N" -eq "$IDX" ]; then
+            echo "$ip" > "$LAST_FILE"
+            echo "$ip"
+            return
+        fi
+        N=$((N + 1))
+    done
+}
+
 # =========================================================
 # INTERNET CHECK
 # =========================================================
@@ -341,47 +410,25 @@ check_internet() {
         fi
     fi
 
-    if [ "$ENABLE_ICMP" = "1" ]; then
+   if [ "$ENABLE_ICMP" = "1" ]; then
 
-        if ping -I "$CHECK_INTERFACE" \
-            -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then
+    RANDOM_IP="$(get_random_icmp)"
 
-            logger -t passwall-failover \
-                "CHECK: ICMP 1.1.1.1 OK"
+    logger -t passwall-failover \
+        "CHECK: ICMP target $RANDOM_IP"
 
-            return 0
-        fi
-
-        if ping -I "$CHECK_INTERFACE" \
-            -c 1 -W 2 9.9.9.9 >/dev/null 2>&1; then
-
-            logger -t passwall-failover \
-                "CHECK: ICMP 9.9.9.9 OK"
-
-            return 0
-        fi
-
-        if ping -I "$CHECK_INTERFACE" \
-            -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
-
-            logger -t passwall-failover \
-                "CHECK: ICMP 8.8.8.8 OK"
-
-            return 0
-        fi
-
-        if ping -I "$CHECK_INTERFACE" \
-            -c 1 -W 2 208.67.222.222 >/dev/null 2>&1; then
-
-            logger -t passwall-failover \
-                "CHECK: ICMP OpenDNS OK"
-
-            return 0
-        fi
+    if ping -I "$CHECK_INTERFACE" \
+        -c 1 -W 2 "$RANDOM_IP" >/dev/null 2>&1; then
 
         logger -t passwall-failover \
-            "CHECK: all ICMP checks failed"
+            "CHECK: ICMP $RANDOM_IP OK"
+
+        return 0
     fi
+
+    logger -t passwall-failover \
+        "CHECK: ICMP $RANDOM_IP FAIL"
+fi
 
     if [ "$ENABLE_SOCKS" = "1" ]; then
 
