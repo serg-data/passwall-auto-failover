@@ -1,7 +1,7 @@
 #!/bin/sh
 
-BOT_TOKEN=".........."
-CHAT_ID="........."
+BOT_TOKEN="8472993466:AAEelwencKR-V582TdqIZqVDKH54nJFtsTw"
+CHAT_ID="880795265"
 
 ROUTER_ID="$(cat /etc/myvpn-id 2>/dev/null || echo OpenWrt)"
 
@@ -46,7 +46,7 @@ flush_queue() {
 
 send_tg() {
 
-    MSG="$1"
+    MSG="[$(date '+%H:%M:%S')] $1"
 
     telegram_ok || {
         echo "$MSG" >> "$QUEUE_FILE"
@@ -59,6 +59,14 @@ send_tg() {
         echo "$MSG" >> "$QUEUE_FILE"
     fi
 }
+
+(
+    while true
+    do
+        flush_queue
+        sleep 60
+    done
+) &
 
 logread -f | while read -r line
 do
