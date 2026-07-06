@@ -69,6 +69,21 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # =========================================================
+# RANDOM START DELAY
+# =========================================================
+
+if [ "$ENABLE_RANDOM_DELAY" = "1" ]; then
+
+    RANDOM_DELAY=$(awk -v max="$RANDOM_DELAY_MAX" \
+        'BEGIN{srand(); print int(rand()*(max+1))}')
+
+    logger -t passwall-failover \
+        "STATE: random delay ${RANDOM_DELAY}s"
+
+    sleep "$RANDOM_DELAY"
+fi
+
+# =========================================================
 # Passwall2 Auto Failover (OpenWrt)
 #
 # Скрипт выбора резервной ноды
@@ -110,6 +125,8 @@ OK_LIMIT=3
 DNS_FAIL_LIMIT=10
 
 CHECK_INTERFACE="wan"
+ENABLE_RANDOM_DELAY=1
+RANDOM_DELAY_MAX=30
 
 ENABLE_ICMP=1
 ENABLE_SOCKS=0
