@@ -68,20 +68,6 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-# =========================================================
-# RANDOM START DELAY
-# =========================================================
-
-if [ "$ENABLE_RANDOM_DELAY" = "1" ]; then
-
-    RANDOM_DELAY=$(awk -v max="$RANDOM_DELAY_MAX" \
-        'BEGIN{srand(); print int(rand()*(max+1))}')
-
-    logger -t passwall-failover \
-        "STATE: random delay ${RANDOM_DELAY}s"
-
-    sleep "$RANDOM_DELAY"
-fi
 
 # =========================================================
 # Passwall2 Auto Failover (OpenWrt)
@@ -142,6 +128,21 @@ TCP_FALLBACK_PORT="443"
 TCP_FALLBACK_TIMEOUT="3"
 
 LTE_MODE=1
+
+# =========================================================
+# RANDOM START DELAY
+# =========================================================
+
+if [ "$ENABLE_RANDOM_DELAY" = "1" ]; then
+
+    RANDOM_DELAY=$(awk -v max="$RANDOM_DELAY_MAX" \
+        'BEGIN{srand(); print int(rand()*(max+1))}')
+
+    logger -t passwall-failover \
+        "STATE: random delay ${RANDOM_DELAY}s"
+
+    sleep "$RANDOM_DELAY"
+fi
 
 
 # =========================================================
@@ -659,11 +660,22 @@ restart_passwall() {
 
     sleep "$TRANSITION_STOP_DELAY"
 
-    /etc/init.d/passwall2 start
+/etc/init.d/passwall2 start
 
-    mark_warmup
+mark_warmup
 
-    return 0
+# Дождаться появления CAKE
+sleep 5
+
+# Проверить cake-autorate
+if ! ps w | grep '[c]ake-autorate\.sh' >/dev/null; then
+    logger -t passwall-failover \
+        "ACTION: restarting cake-autorate"
+
+    /etc/init.d/cake-autorate restart
+fi
+
+return 0
 }
 
 
@@ -719,6 +731,17 @@ switch_node() {
     /etc/init.d/passwall2 start
 
     mark_warmup
+
+    # Дождаться появления CAKE
+    sleep 5
+
+    # Проверить cake-autorate
+    if ! ps w | grep '[c]ake-autorate\.sh' >/dev/null; then
+        logger -t passwall-failover \
+            "ACTION: restarting cake-autorate"
+
+       /etc/init.d/cake-autorate restart
+   fi
 
     CURRENT_NODE="$NODE"
 }
