@@ -27,6 +27,15 @@ start() {
 }
 
 stop() {
-    pid=$(ps w | awk '/[c]ake-autorate\.sh/ {print $1; exit}')
-    [ -n "$pid" ] && kill "$pid"
+    # Останавливаем все процессы cake-autorate.sh
+    while true; do
+        pids="$(ps w | awk '/[c]ake-autorate\.sh/ {print $1}')"
+        [ -z "$pids" ] && break
+
+        for pid in $pids; do
+            kill "$pid" 2>/dev/null
+        done
+
+        sleep 1
+    done
 }
