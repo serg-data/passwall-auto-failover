@@ -70,6 +70,63 @@ trap cleanup EXIT INT TERM
 
 
 # =========================================================
+# LOGGING
+# =========================================================
+
+# LOG CATEGORIES:
+#
+# ERROR    - fatal errors
+# ACTION   - service actions
+# DECISION - failover decisions
+# STATE    - current state
+# MEMORY   - memory monitoring
+# CHECK    - network diagnostics
+# WAIT     - startup/shutdown tracing
+
+LOG_LEVEL=2
+
+# LOG_LEVEL:
+# 2 = STATE + MEMORY
+# 3 = CHECK
+# 4 = WAIT
+#
+# ACTION / DECISION / ERROR
+# всегда записываются независимо от LOG_LEVEL.
+
+log_error() {
+    logger -t passwall-failover "$@"
+}
+
+log_action() {
+    logger -t passwall-failover "$@"
+}
+
+log_decision() {
+    logger -t passwall-failover "$@"
+}
+
+log_memory() {
+    [ "$LOG_LEVEL" -ge 2 ] || return
+    logger -t passwall-failover "$@"
+}
+
+log_state() {
+    [ "$LOG_LEVEL" -ge 2 ] || return
+    logger -t passwall-failover "$@"
+}
+
+log_check() {
+    [ "$LOG_LEVEL" -ge 3 ] || return
+    logger -t passwall-failover "$@"
+}
+
+log_wait() {
+    [ "$LOG_LEVEL" -ge 4 ] || return
+    logger -t passwall-failover "$@"
+}
+
+
+# =========================================================
 # Passwall2 Auto Failover (OpenWrt)
 #
 # Скрипт выбора резервной ноды
@@ -138,7 +195,7 @@ if [ "$ENABLE_RANDOM_DELAY" = "1" ]; then
     RANDOM_DELAY=$(awk -v max="$RANDOM_DELAY_MAX" \
         'BEGIN{srand(); print int(rand()*(max+1))}')
 
-    logger -t passwall-failover \
+    log_state \
         "STATE: random delay ${RANDOM_DELAY}s"
 
     sleep "$RANDOM_DELAY"
@@ -282,13 +339,13 @@ wait_core_stop() {
         if [ "$XRAY_RUNNING" = "0" ] && \
            [ "$SING_RUNNING" = "0" ]; then
 
-            logger -t passwall-failover \
+            log_wait \
                 "WAIT: proxy core fully stopped"
 
             break
         fi
 
-        logger -t passwall-failover \
+        log_wait \
             "WAIT: proxy core still stopping..."
 
         sleep 1
@@ -321,7 +378,7 @@ wait_warmup_finish() {
 
     while warmup_active; do
 
-        logger -t passwall-failover \
+        log_wait \
             "WAIT: warmup active"
 
         sleep 1
@@ -341,13 +398,13 @@ check_real_wan() {
         -c 1 -W 3 "$REAL_WAN_IP" \
         >/dev/null 2>&1; then
 
-        logger -t passwall-failover \
+        log_check \
             "CHECK: real WAN OK"
 
         return 0
     fi
 
-    logger -t passwall-failover \
+    log_check \
         "CHECK: real WAN FAIL"
 
     return 1
@@ -369,13 +426,13 @@ check_socks_node() {
         http://cp.cloudflare.com \
         >/dev/null 2>&1; then
 
-        logger -t passwall-failover \
+        log_check \
             "CHECK: SOCKS node OK"
 
         return 0
     fi
 
-    logger -t passwall-failover \
+    log_check \
         "CHECK: SOCKS node FAIL"
 
     return 1
@@ -421,7 +478,7 @@ check_internet() {
 
         if ! ip route | grep -q '^default'; then
 
-            logger -t passwall-failover \
+            log_check \
                 "CHECK: no default route (LTE blink)"
 
             return 2
@@ -432,30 +489,30 @@ check_internet() {
 
     RANDOM_IP="$(get_random_icmp)"
 
-    logger -t passwall-failover \
+    log_check \
         "CHECK: ICMP target $RANDOM_IP"
 
     if ping -I "$CHECK_INTERFACE" \
         -c 1 -W 2 "$RANDOM_IP" >/dev/null 2>&1; then
 
-        logger -t passwall-failover \
+        log_check \
             "CHECK: ICMP $RANDOM_IP OK"
 
         return 0
     fi
 
-    logger -t passwall-failover \
+    log_check \
         "CHECK: ICMP $RANDOM_IP FAIL"
 fi
 
     if [ "$ENABLE_SOCKS" = "1" ]; then
 
-    logger -t passwall-failover \
+    log_check \
         "CHECK: trying SOCKS"
 
     if check_socks_node; then
 
-        logger -t passwall-failover \
+        log_check \
             "CHECK: SOCKS fallback OK"
 
         return 0
@@ -464,7 +521,7 @@ fi
 
 if [ "$ENABLE_TCP_FALLBACK" = "1" ]; then
 
-    logger -t passwall-failover \
+    log_check \
         "CHECK: trying TCP fallback"
 
     if check_tcp_fallback; then
@@ -473,7 +530,7 @@ if [ "$ENABLE_TCP_FALLBACK" = "1" ]; then
     fi
 fi
 
-logger -t passwall-failover \
+log_check \
     "CHECK: FAIL (all enabled checks failed)"
 
 return 1
@@ -494,13 +551,13 @@ check_tcp_fallback() {
         https://$TCP_FALLBACK_HOST \
         >/dev/null 2>&1; then
 
-        logger -t passwall-failover \
+        log_check \
             "CHECK: TCP fallback OK ($TCP_FALLBACK_HOST via $CHECK_INTERFACE)"
 
         return 0
     fi
 
-    logger -t passwall-failover \
+    log_check \
         "CHECK: TCP fallback FAIL ($TCP_FALLBACK_HOST via $CHECK_INTERFACE)"
 
     return 1
@@ -515,7 +572,7 @@ check_dns() {
     if nslookup example.com 1.1.1.1 \
         >/dev/null 2>&1; then
 
-        logger -t passwall-failover \
+        log_check \
             "CHECK: DNS OK (1.1.1.1)"
 
         return 0
@@ -524,7 +581,7 @@ check_dns() {
     if nslookup cloudflare.com 8.8.8.8 \
         >/dev/null 2>&1; then
 
-        logger -t passwall-failover \
+        log_check \
             "CHECK: DNS OK (8.8.8.8)"
 
         return 0
@@ -533,13 +590,13 @@ check_dns() {
     if nslookup microsoft.com 9.9.9.9 \
         >/dev/null 2>&1; then
 
-        logger -t passwall-failover \
+        log_check \
             "CHECK: DNS OK (9.9.9.9)"
 
         return 0
     fi
 
-    logger -t passwall-failover \
+    log_check \
         "CHECK: DNS FAIL"
 
     return 1
@@ -556,7 +613,7 @@ check_memory() {
 
     if warmup_active; then
 
-        logger -t passwall-failover \
+        log_memory \
             "MEMORY: warmup active, skipping recovery"
 
         return 0
@@ -568,7 +625,7 @@ check_memory() {
 
     [ -z "$AVAILABLE_RAM" ] && AVAILABLE_RAM=0
 
-    logger -t passwall-failover \
+    log_memory \
         "MEMORY: available=${AVAILABLE_RAM}MB"
 
     if [ "$AVAILABLE_RAM" -ge "$MEMORY_MIN_AVAILABLE" ]; then
@@ -583,7 +640,7 @@ check_memory() {
 
     if [ $((NOW - LAST)) -lt "$MEMORY_COOLDOWN" ]; then
 
-        logger -t passwall-failover \
+        log_memory \
             "MEMORY: cooldown active"
 
         return 1
@@ -763,7 +820,7 @@ UPTIME_CYCLE=$(($(cat "$UPTIME_CYCLE_FILE" \
 
 echo "$UPTIME_CYCLE" > "$UPTIME_CYCLE_FILE"
 
-logger -t passwall-failover \
+log_state \
     "STATE: uptime cycle #$UPTIME_CYCLE"
 
 
@@ -773,7 +830,7 @@ logger -t passwall-failover \
 
 if warmup_active; then
 
-    logger -t passwall-failover \
+    log_state \
         "STATE: warmup active"
 
     check_internet
@@ -798,7 +855,7 @@ if [ "$ENABLE_DNS_CHECK" = "1" ]; then
     if [ "$RESULT" = "1" ] && \
        [ "$CURRENT_NODE" != "$BACKUP_NODE" ]; then
 
-        logger -t passwall-failover \
+        log_state \
             "DNS: skipped due to PRIMARY fail"
 
         DNS_RESULT=0
@@ -823,7 +880,7 @@ if [ "$DNS_RESULT" != "0" ]; then
 
     echo "$DNS_FAIL" > "$DNS_FAIL_FILE"
 
-    logger -t passwall-failover \
+    log_state \
         "STATE: DNS FAIL ($DNS_FAIL/$DNS_FAIL_LIMIT)"
 
     if [ "$DNS_FAIL" -ge "$DNS_FAIL_LIMIT" ]; then
@@ -841,7 +898,7 @@ if [ "$DNS_RESULT" != "0" ]; then
             if [ $((NOW - LAST)) -lt \
                 "$REAL_WAN_FAIL_COOLDOWN" ]; then
 
-                logger -t passwall-failover \
+                log_state \
                     "DNS: WAN cooldown active, restart skipped"
 
                 DNS_BLOCKED=1
@@ -874,7 +931,7 @@ case "$RESULT" in
 
         echo "$OK" > "$OK_FILE"
 
-        logger -t passwall-failover \
+        log_state \
             "STATE: WAN OK ($OK/$OK_LIMIT), node=$CURRENT_NODE"
 
         echo 0 > "$FAIL_FILE"
@@ -897,7 +954,7 @@ case "$RESULT" in
 
         echo "$FAIL" > "$FAIL_FILE"
 
-        logger -t passwall-failover \
+        log_state \
             "STATE: FAIL ($FAIL/$FAIL_LIMIT), node=$CURRENT_NODE"
 
         if [ "$CURRENT_NODE" = "$BACKUP_NODE" ]; then
@@ -911,7 +968,7 @@ case "$RESULT" in
                 if [ $((NOW - LAST)) -lt \
                     "$REAL_WAN_FAIL_COOLDOWN" ]; then
 
-                    logger -t passwall-failover \
+                    log_state \
                         "STATE: WAN cooldown active"
 
                     exit 0
@@ -919,7 +976,7 @@ case "$RESULT" in
 
                 echo "$NOW" > "$REAL_WAN_FAIL_FILE"
 
-                logger -t passwall-failover \
+                log_state \
                     "STATE: real WAN dead, skipping recovery"
 
                 exit 0
@@ -939,7 +996,7 @@ case "$RESULT" in
 
     2)
 
-        logger -t passwall-failover \
+        log_state \
             "STATE: LTE blink detected, counters unchanged"
         ;;
 
