@@ -3,7 +3,10 @@
 START=99
 STOP=10
 
-start() {
+USE_PROCD=1
+
+start_service() {
+    # Уже запущен?
     pid=$(ps w | awk '/[c]ake-autorate\.sh/ {print $1; exit}')
     [ -n "$pid" ] && return 0
 
@@ -23,19 +26,12 @@ start() {
 
     logger -t cake-autorate "Starting cake-autorate"
 
-    /bin/bash /root/cake-autorate/cake-autorate.sh >/dev/null 2>&1 &
+    procd_open_instance
+    procd_set_param command /bin/bash /root/cake-autorate/cake-autorate.sh
+    procd_set_param respawn
+    procd_close_instance
 }
 
-stop() {
-    # Останавливаем все процессы cake-autorate.sh
-    while true; do
-        pids="$(ps w | awk '/[c]ake-autorate\.sh/ {print $1}')"
-        [ -z "$pids" ] && break
-
-        for pid in $pids; do
-            kill "$pid" 2>/dev/null
-        done
-
-        sleep 1
-    done
+stop_service() {
+    logger -t cake-autorate "Stopping cake-autorate"
 }
